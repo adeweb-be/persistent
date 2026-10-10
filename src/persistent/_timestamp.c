@@ -582,9 +582,15 @@ module_init(void)
     module = PyModule_Create(&moduledef);
     if (module == NULL)
         return NULL;
+#ifdef Py_GIL_DISABLED
+    /* This module can run without the GIL. */
+    PyUnstable_Module_SetGIL(module, Py_MOD_GIL_NOT_USED);
+#endif
 
     Py_SET_TYPE((PyObject*)&TimeStamp_type, &PyType_Type);
     TimeStamp_type.tp_getattro = PyObject_GenericGetAttr;
+    if (PyType_Ready(&TimeStamp_type) < 0)
+        return NULL;
 
     return module;
 }

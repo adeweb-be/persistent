@@ -103,6 +103,7 @@ static char cPickleCache_doc_string[] =
 /* Python string objects to speed lookups; set by module init. */
 static PyObject *py__p_changed;
 static PyObject *py__p_deactivate;
+static PyObject *py__p_invalidate;
 static PyObject *py__p_jar;
 static PyObject *py__p_oid;
 
@@ -364,26 +365,11 @@ cc_minimize(ccobject *self, PyObject *args)
 static int
 _invalidate(ccobject *self, PyObject *key)
 {
-    static PyObject *_p_invalidate = NULL;
     PyObject *meth, *v;
 
     v = PyDict_GetItem(self->data, key);
     if (v == NULL)
         return 0;
-
-    if (_p_invalidate == NULL)
-    {
-        _p_invalidate = INTERN("_p_invalidate");
-        if (_p_invalidate == NULL)
-        {
-            /* It doesn't make any sense to ignore this error, but
-                the caller ignores all errors.
-
-                TODO: and why does it do that? This should be fixed
-            */
-            return -1;
-        }
-    }
 
     if (Py_REFCNT(v) <= 1 && PyType_Check(v))
     {
@@ -397,7 +383,7 @@ _invalidate(ccobject *self, PyObject *key)
         return PyDict_DelItem(self->data, key);
     }
 
-    meth = PyObject_GetAttr(v, _p_invalidate);
+    meth = PyObject_GetAttr(v, py__p_invalidate);
     if (meth == NULL)
         return -1;
 
@@ -781,7 +767,6 @@ cc_new_ghost(ccobject *self, PyObject *args)
     tmp = PyDict_GetItem(self->data, key);
     if (tmp)
     {
-        Py_DECREF(tmp);
         PyErr_SetString(PyExc_ValueError,
                         "The given oid is already in the cache");
         return NULL;
@@ -1360,6 +1345,12 @@ module_init(void)
     }
 
     module = PyModule_Create(&moduledef);
+    if (module == NULL)
+        return NULL;
+#ifdef Py_GIL_DISABLED
+    /* This module can run without the GIL. */
+    PyUnstable_Module_SetGIL(module, Py_MOD_GIL_NOT_USED);
+#endif
 
     cPersistenceCAPI = (cPersistenceCAPIstruct *)PyCapsule_Import(CAPI_CAPSULE_NAME, 0);
     if (!cPersistenceCAPI)
@@ -1371,6 +1362,9 @@ module_init(void)
         return NULL;
     py__p_deactivate = INTERN("_p_deactivate");
     if (!py__p_deactivate)
+        return NULL;
+    py__p_invalidate = INTERN("_p_invalidate");
+    if (!py__p_invalidate)
         return NULL;
     py__p_jar = INTERN("_p_jar");
     if (!py__p_jar)

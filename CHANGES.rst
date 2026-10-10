@@ -4,6 +4,13 @@ Change log
 6.9 (unreleased)
 ----------------
 
+- Declare free-threading support in the C extensions, so that importing them
+  on CPython 3.14t no longer enables the GIL. Module state that was
+  initialised lazily (interned strings, the ``TimeStamp`` factory and type)
+  is now created at module init, ``__slotnames__`` is read with a strong
+  reference on Python 3.13+, and the C ``PickleCache.new_ghost`` no longer
+  releases a reference it does not own when the oid is already in the cache.
+
 
 6.8 (2026-08-20)
 ----------------

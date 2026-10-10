@@ -35,6 +35,10 @@ static PyObject *py___getattr__, *py___setattr__, *py___delattr__;
 static PyObject *py___slotnames__, *copy_reg_slotnames, *__newobj__;
 static PyObject *py___getnewargs__, *py___getstate__;
 static PyObject *py_unsaved, *py_ghost, *py_saved, *py_changed, *py_sticky;
+static PyObject *py_register, *py_readCurrent;
+
+/* persistent._timestamp.TimeStamp, set by module_init(). */
+static PyObject *TimeStamp;
 
 
 static int
@@ -60,6 +64,8 @@ init_strings(void)
   INIT_STRING(saved);
   INIT_STRING(changed);
   INIT_STRING(sticky);
+  INIT_STRING(register);
+  INIT_STRING(readCurrent);
 #undef INIT_STRING
   return 0;
 }
@@ -255,11 +261,8 @@ changed(cPersistentObject *self)
         && self->jar)
     {
         PyObject *meth, *arg, *result;
-        static PyObject *s_register;
 
-        if (s_register == NULL)
-            s_register = INTERN("register");
-        meth = PyObject_GetAttr((PyObject *)self->jar, s_register);
+        meth = PyObject_GetAttr((PyObject *)self->jar, py_register);
         if (meth == NULL)
             return -1;
         arg = PyTuple_New(1);
@@ -290,13 +293,9 @@ readCurrent(cPersistentObject *self)
         self->state == cPersistent_STICKY_STATE)
         && self->jar && self->oid)
     {
-        static PyObject *s_readCurrent=NULL;
         PyObject *r;
 
-        if (s_readCurrent == NULL)
-            s_readCurrent = INTERN("readCurrent");
-
-        r = PyObject_CallMethodObjArgs(self->jar, s_readCurrent, self, NULL);
+        r = PyObject_CallMethodObjArgs(self->jar, py_readCurrent, self, NULL);
         if (r == NULL)
             return -1;
 
@@ -365,16 +364,28 @@ pickle_slotnames(PyTypeObject *cls)
 {
     PyObject *slotnames;
 
+#if PY_VERSION_HEX >= 0x030D0000
+    /* Other threads can change the class dict. Get a strong reference. */
+    if (PyDict_GetItemRef(cls->tp_dict, py___slotnames__, &slotnames) < 0)
+        return NULL;
+#else
     slotnames = PyDict_GetItem(cls->tp_dict, py___slotnames__);
+    Py_XINCREF(slotnames);
+#endif
     if (slotnames)
     {
         int n = PyObject_Not(slotnames);
         if (n < 0)
+        {
+            Py_DECREF(slotnames);
             return NULL;
+        }
         if (n)
+        {
+            Py_DECREF(slotnames);
             slotnames = Py_None;
-
-        Py_INCREF(slotnames);
+            Py_INCREF(slotnames);
+        }
         return slotnames;
     }
 
@@ -1240,7 +1251,6 @@ Per_set_serial(cPersistentObject *self, PyObject *v)
 static PyObject *
 Per_get_mtime(cPersistentObject *self)
 {
-    static PyObject* TimeStamp;
     PyObject *t, *v;
 
     if (unghostify(self) < 0)
@@ -1252,18 +1262,6 @@ Per_get_mtime(cPersistentObject *self)
     {
         Py_INCREF(Py_None);
         return Py_None;
-    }
-
-    if (!TimeStamp)
-    {
-        PyObject* ts_module;
-        ts_module = PyImport_ImportModule("persistent._timestamp");
-        if (!ts_module)
-            return NULL;
-        TimeStamp = PyObject_GetAttrString(ts_module, "TimeStamp");
-        Py_DECREF(ts_module);
-        if (!TimeStamp)
-          return NULL;
     }
 
     t = PyObject_CallFunction(TimeStamp, "y#", self->serial, (Py_ssize_t)8);
@@ -1681,12 +1679,18 @@ static PyObject*
 module_init(void)
 {
     PyObject *module, *capi;
-    PyObject *copy_reg;
+    PyObject *copy_reg, *ts_module;
 
     if (init_strings() < 0)
         return NULL;
 
     module = PyModule_Create(&moduledef);
+    if (module == NULL)
+        return NULL;
+#ifdef Py_GIL_DISABLED
+    /* This module can run without the GIL. */
+    PyUnstable_Module_SetGIL(module, Py_MOD_GIL_NOT_USED);
+#endif
 
     Py_SET_TYPE((PyObject*)&Pertype, &PyType_Type);
     Pertype.tp_new = PyType_GenericNew;
@@ -1734,6 +1738,14 @@ module_init(void)
       Py_DECREF(copy_reg);
       return NULL;
     }
+
+    ts_module = PyImport_ImportModule("persistent._timestamp");
+    if (!ts_module)
+        return NULL;
+    TimeStamp = PyObject_GetAttrString(ts_module, "TimeStamp");
+    Py_DECREF(ts_module);
+    if (!TimeStamp)
+        return NULL;
 
     return module;
 }

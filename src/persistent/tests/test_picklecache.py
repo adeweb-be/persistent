@@ -12,6 +12,7 @@
 #
 ##############################################################################
 import gc
+import sys
 import unittest
 
 from persistent._compat import PYPY
@@ -1292,6 +1293,25 @@ class CPickleCacheTests(PickleCacheTestMixin, unittest.TestCase):
     def test___setitem___persistent_class(self):
         cache = self._check___setitem___persistent_class()
         self.assertEqual(_len(cache.items()), 1)
+
+    def test_new_ghost_same_oid_twice(self):
+        # The second call fails and must not release a reference to the
+        # object that is already in the cache.
+        KEY = b'123'
+        cache = self._makeOne()
+        candidate = self._makePersist(oid=None, jar=None)
+        cache.new_ghost(KEY, candidate)
+        # Keep the object alive if the call releases a reference.
+        keep = [candidate]
+        refcount = sys.getrefcount(candidate)
+        other = self._makePersist(oid=None, jar=None)
+        with self.assertRaises(ValueError):
+            cache.new_ghost(KEY, other)
+        self.assertEqual(sys.getrefcount(candidate), refcount)
+        self.assertIs(cache.get(KEY), candidate)
+        cache.new_ghost(b'456', other)
+        self.assertEqual(len(cache), 2)
+        del keep
 
     def test_cache_garbage_collection_bytes_with_cache_size_0(self):
 
