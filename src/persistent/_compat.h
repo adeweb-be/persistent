@@ -35,4 +35,12 @@
 #define Py_TRASHCAN_END Py_TRASHCAN_SAFE_END(NULL)
 #endif
 
+/* The free-threaded build of Python 3.14 and later runs the C extensions
+   without the GIL. The pickle cache then needs PyUnstable_TryIncRef(),
+   which is new in Python 3.14. The free-threaded build of Python 3.13
+   keeps the GIL. */
+#if defined(Py_GIL_DISABLED) && PY_VERSION_HEX >= 0x030E0000
+#define PER_FREE_THREADING 1
+#endif
+
 #endif

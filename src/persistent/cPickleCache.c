@@ -1347,7 +1347,7 @@ module_init(void)
     module = PyModule_Create(&moduledef);
     if (module == NULL)
         return NULL;
-#ifdef Py_GIL_DISABLED
+#ifdef PER_FREE_THREADING
     /* This module can run without the GIL. */
     PyUnstable_Module_SetGIL(module, Py_MOD_GIL_NOT_USED);
 #endif

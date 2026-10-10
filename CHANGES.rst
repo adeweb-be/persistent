@@ -11,6 +11,11 @@ Change log
   reference on Python 3.13+, and the C ``PickleCache.new_ghost`` no longer
   releases a reference it does not own when the oid is already in the cache.
 
+- Declare free-threading support in ``cPersistence`` and ``cPickleCache``
+  only on CPython 3.14t and later. The pickle cache needs
+  ``PyUnstable_TryIncRef()``, which is new in 3.14. On 3.13t, importing them
+  enables the GIL.
+
 
 6.8 (2026-08-20)
 ----------------
