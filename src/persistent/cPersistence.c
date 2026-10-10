@@ -158,9 +158,17 @@ static PyTypeObject Pertype;
 static void
 accessed(cPersistentObject *self)
 {
+    PerCache *cache = self->cache;
+
     /* Do nothing unless the object is in a cache and not a ghost. */
-    if (self->cache && self->state >= 0 && self->ring.r_next)
-        ring_move_to_head(&self->cache->ring_home, &self->ring);
+    if (cache && self->state >= 0)
+    {
+        /* Another thread can sweep the cache. */
+        PER_BEGIN_CRITICAL_SECTION(cache);
+        if (self->cache == cache && self->ring.r_next)
+            ring_move_to_head(&cache->ring_home, &self->ring);
+        PER_END_CRITICAL_SECTION();
+    }
 }
 
 #ifdef PER_FREE_THREADING

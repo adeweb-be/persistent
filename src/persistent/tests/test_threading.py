@@ -6,8 +6,8 @@ particularly on the free-threaded build of Python (3.14t and later):
 - Per_dealloc removes the cache entry of an object while other threads
   use the same cache.
 - A lookup must not return an object that another thread is freeing.
-- Sweeps and deactivation change the LRU ring of one cache from
-  several threads.
+- Sweeps, deactivation and attribute access change the LRU ring of one
+  cache from several threads.
 
 The tests are also valuable on standard (GIL) Python to catch
 concurrency issues with greenlets or signal handlers.
@@ -308,6 +308,71 @@ class ConcurrentCacheTests(TestCase):
         gc.collect()
         # Each freed object removed its entry.
         self.assertEqual(len(cache), 0)
+
+    def test_attribute_access_during_sweep(self):
+        """Read attributes while another thread sweeps the cache.
+
+        An attribute access moves the object in the ring of its cache.
+        DB.cacheMinimize() sweeps the caches of connections that other
+        threads use. The two threads use different objects of one cache.
+        """
+        jar = self._makeJar()
+        cache = jar._cache
+
+        class P(self._makePersistentClass()):
+            attr = 42
+
+        def add(start):
+            objs = []
+            for i in range(start, start + 200):
+                obj = P()
+                obj._p_oid = _make_oid(i)
+                obj._p_jar = jar
+                cache[obj._p_oid] = obj
+                objs.append(obj)
+            return objs
+
+        # The sweeps skip changed objects.
+        read_objs = add(0)
+        for obj in read_objs:
+            obj._p_changed = True
+        swept_objs = add(1000)
+        errors = []
+        stop = threading.Event()
+
+        def reader():
+            try:
+                while not stop.is_set():
+                    for obj in read_objs:
+                        if obj.attr != 42:
+                            errors.append(("reader", obj.attr))
+            except Exception as e:
+                errors.append(("reader", e))
+
+        def sweeper():
+            try:
+                for _ in range(100):
+                    for obj in swept_objs:
+                        obj._p_activate()
+                    cache.minimize()
+                    cache.incrgc()
+            except Exception as e:
+                errors.append(("sweeper", e))
+            finally:
+                stop.set()
+
+        threads = [
+            threading.Thread(target=reader),
+            threading.Thread(target=sweeper),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+            self.assertFalse(t.is_alive(), "Thread hung")
+        self.assertEqual(errors, [], f"Errors in threads: {errors}")
+        self.assertEqual(cache.ringlen(), len(read_objs))
+        self.assertEqual(cache.cache_non_ghost_count, len(read_objs))
 
     def test_rapid_create_destroy_cycle(self):
         """Rapidly create and destroy objects to stress refcount handling.
