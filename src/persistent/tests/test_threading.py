@@ -1,11 +1,13 @@
 """Tests for concurrent access to persistent objects and the pickle cache.
 
 These tests exercise the C extensions under multi-threaded conditions,
-particularly to verify the free-threaded Python (3.14t+) fixes:
+particularly on the free-threaded build of Python (3.14t and later):
 
-- Per_dealloc refcount resurrection to prevent infinite recursion
-  when PyDict_GetItem INCREFs/DECREFs stolen-reference objects
-- Cache dict operations that internally INCREF/DECREF values
+- Per_dealloc removes the cache entry of an object while other threads
+  use the same cache.
+- A lookup must not return an object that another thread is freeing.
+- Sweeps and deactivation change the LRU ring of one cache from
+  several threads.
 
 The tests are also valuable on standard (GIL) Python to catch
 concurrency issues with greenlets or signal handlers.
@@ -245,12 +247,73 @@ class ConcurrentCacheTests(TestCase):
             self.assertFalse(t.is_alive(), "Thread hung")
         self.assertEqual(errors, [], f"Errors in threads: {errors}")
 
+    def test_lookup_during_final_decref(self):
+        """Look up oids while another thread frees the objects.
+
+        This is the race of a connection pool: one thread releases the
+        last references to the objects of a cache while the next thread
+        loads the same oids. A lookup must not return an object that is
+        being freed. A new ghost can then take the oid.
+        """
+        jar = self._makeJar()
+        cache = jar._cache
+        P = self._makePersistentClass()
+        n_oids = 100
+        errors = []
+        stop = threading.Event()
+        oids = [_make_oid(i) for i in range(n_oids)]
+
+        def load():
+            for oid in oids:
+                obj = cache.get(oid)
+                if obj is None:
+                    obj = P()
+                    try:
+                        cache.new_ghost(oid, obj)
+                    except ValueError:
+                        # Another thread loaded this oid first.
+                        continue
+                if obj._p_oid != oid:
+                    errors.append(("wrong object", oid, obj._p_oid))
+                yield obj
+
+        def holder():
+            # Hold the ghosts, then free them all at once.
+            try:
+                for _ in range(100):
+                    objs = list(load())
+                    del objs
+            except Exception as e:
+                errors.append(("holder", e))
+            finally:
+                stop.set()
+
+        def loader():
+            # Load each oid and drop it at once.
+            try:
+                while not stop.is_set():
+                    for obj in load():
+                        del obj
+            except Exception as e:
+                errors.append(("loader", e))
+
+        threads = [threading.Thread(target=holder)]
+        threads += [threading.Thread(target=loader) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+            self.assertFalse(t.is_alive(), "Thread hung")
+        self.assertEqual(errors, [], f"Errors in threads: {errors}")
+        gc.collect()
+        # Each freed object removed its entry.
+        self.assertEqual(len(cache), 0)
+
     def test_rapid_create_destroy_cycle(self):
         """Rapidly create and destroy objects to stress refcount handling.
 
-        On free-threaded Python, this exercises the Py_SET_REFCNT
-        resurrection in Per_dealloc that prevents recursive deallocation
-        during cache dict cleanup.
+        On free-threaded Python, this exercises the removal of cache
+        entries in Per_dealloc while other threads add entries.
         """
         jar = self._makeJar()
         errors = []

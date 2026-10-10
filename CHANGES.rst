@@ -16,6 +16,16 @@ Change log
   ``PyUnstable_TryIncRef()``, which is new in 3.14. On 3.13t, importing them
   enables the GIL.
 
+- Make the C ``PickleCache`` safe without the GIL. On the free-threaded
+  build, a critical section on the cache protects its dict, its LRU ring and
+  its counters in the cache methods, the sweeps, deactivation and
+  deallocation. The dict holds small entry objects instead of uncounted
+  references, and lookups take a reference with ``PyUnstable_TryIncRef()``,
+  so that a lookup in one thread cannot return an object that another thread
+  is freeing. On that build, ``PickleCache.items()`` returns a list.
+  Attribute access and the loading of ghosts change the ring without the
+  critical section: they rely on one thread at a time per connection.
+
 
 6.8 (2026-08-20)
 ----------------

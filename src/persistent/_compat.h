@@ -43,4 +43,15 @@
 #define PER_FREE_THREADING 1
 #endif
 
+/* A critical section on a pickle cache. Without PER_FREE_THREADING, the
+   GIL protects the cache and these macros do nothing. */
+#ifdef PER_FREE_THREADING
+#define PER_BEGIN_CRITICAL_SECTION(op) Py_BEGIN_CRITICAL_SECTION(op)
+#define PER_END_CRITICAL_SECTION() Py_END_CRITICAL_SECTION()
+#else
+#define PER_BEGIN_CRITICAL_SECTION(op) {
+/* The null statement lets a label come just before this macro. */
+#define PER_END_CRITICAL_SECTION() (void)0; }
+#endif
+
 #endif

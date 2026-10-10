@@ -85,6 +85,25 @@
   the ring, however they can not be deactivated. The garbage collection
   process must skip such objects, rather than deactivating them.
 
+  The free-threaded build
+
+  Without the GIL, a critical section on the cache object protects the
+  dict, the ring and the counters. The functions in cPersistence.c that
+  change the ring or the counters take the same critical section.
+
+  The dict cannot hold the uncounted references directly. A dict lookup
+  increments and decrements the reference count of the value. This can
+  free an object that another thread released, or bring back an object
+  that is being freed. Thus the dict holds an entry object for each
+  persistent object. The entry holds the uncounted reference.
+
+  The reference count of an object can reach zero while its entry is
+  still in the dict. The deallocation function then waits for the
+  critical section, and removes the entry. The memory of the object
+  stays valid until then. A lookup gets a new reference with
+  PyUnstable_TryIncRef(). If this fails, the object is being freed, and
+  the cache treats it as absent. Another object can then take the oid.
+
 */
 
 static char cPickleCache_doc_string[] =
@@ -144,6 +163,99 @@ typedef struct
 } ccobject;
 
 static int cc_ass_sub(ccobject *self, PyObject *key, PyObject *v);
+
+#ifdef PER_FREE_THREADING
+/* The value of the dict for a persistent object. */
+typedef struct
+{
+    PyObject_HEAD
+    PyObject *object;                    /* uncounted reference */
+} ccentry;
+
+static void
+ccentry_dealloc(ccentry *self)
+{
+    PyObject_Free(self);
+}
+
+static PyTypeObject CcentryType =
+{
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "persistent.cPickleCache.CacheEntry",
+    .tp_basicsize = sizeof(ccentry),
+    .tp_dealloc = (destructor)ccentry_dealloc,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+};
+
+#define IS_ENTRY(V) Py_IS_TYPE((V), &CcentryType)
+#define ENTRY_OBJECT(V) (((ccentry *)(V))->object)
+#endif
+
+/* Return a borrowed reference to the value of key, or NULL.
+   On the free-threaded build, the object can be in deallocation.
+   Call with the critical section held. */
+static PyObject *
+cc_lookup(ccobject *self, PyObject *key)
+{
+    PyObject *v = PyDict_GetItem(self->data, key);
+#ifdef PER_FREE_THREADING
+    if (v != NULL && IS_ENTRY(v))
+        v = ENTRY_OBJECT(v);
+#endif
+    return v;
+}
+
+/* Return a new reference to the value of key, or NULL.
+   On the free-threaded build, return NULL for an object in deallocation.
+   Call with the critical section held. */
+static PyObject *
+cc_lookup_ref(ccobject *self, PyObject *key)
+{
+    PyObject *v = PyDict_GetItem(self->data, key);
+#ifdef PER_FREE_THREADING
+    if (v != NULL && IS_ENTRY(v))
+    {
+        v = ENTRY_OBJECT(v);
+        if (!PyUnstable_TryIncRef(v))
+            return NULL;
+        return v;
+    }
+#endif
+    Py_XINCREF(v);
+    return v;
+}
+
+/* Store an uncounted reference to the persistent object v under key.
+   The caller gives its reference to the dict. On the free-threaded
+   build, the caller keeps its reference.
+   Call with the critical section held. */
+static int
+cc_store(ccobject *self, PyObject *key, PyObject *v)
+{
+#ifdef PER_FREE_THREADING
+    ccentry *entry;
+    int result;
+
+    entry = PyObject_New(ccentry, &CcentryType);
+    if (entry == NULL)
+        return -1;
+    entry->object = v;
+    /* Lookups in other threads use PyUnstable_TryIncRef() on v. */
+    PyUnstable_EnableTryIncRef(v);
+    result = PyDict_SetItem(self->data, key, (PyObject *)entry);
+    Py_DECREF(entry);
+    if (result < 0)
+        return -1;
+    PyObject_GC_UnTrack((void *)self->data);
+#else
+    if (PyDict_SetItem(self->data, key, v) < 0)
+        return -1;
+    /* the dict should have a borrowed reference */
+    PyObject_GC_UnTrack((void *)self->data);
+    Py_DECREF(v);
+#endif
+    return 0;
+}
 
 /* ---------------------------------------------------------------- */
 
@@ -244,6 +356,12 @@ scan_gc_items(ccobject *self, int target, Py_ssize_t target_bytes)
                 code.
             */
             insert_after(&placeholder, here);
+#ifdef PER_FREE_THREADING
+            /* Python code can suspend the critical section. Another
+               thread can then remove the object from the ring. Keep the
+               object alive until the call returns. */
+            Py_INCREF(object);
+#endif
             method = PyObject_GetAttr((PyObject *)object, py__p_deactivate);
             if (method == NULL)
                 error_occurred = 1;
@@ -256,6 +374,9 @@ scan_gc_items(ccobject *self, int target, Py_ssize_t target_bytes)
                 else
                     Py_DECREF(temp);
             }
+#ifdef PER_FREE_THREADING
+            Py_DECREF(object);
+#endif
 
             here = placeholder.r_next;
             unlink_from_ring(&placeholder);
@@ -274,24 +395,28 @@ Done:
 static PyObject *
 lockgc(ccobject *self, int target_size, Py_ssize_t target_size_bytes)
 {
-    /* This is thread-safe because of the GIL, and there's nothing
-    * in between checking the ring_lock and acquiring it that calls back
-    * into Python.
+    int result = 0;
+
+    /* This is thread-safe because of the GIL, or of the critical section
+    * on the free-threaded build. There's nothing in between checking the
+    * ring_lock and acquiring it that calls back into Python.
+    *
+    * scan_gc_items() calls Python code, which can suspend the critical
+    * section. Other threads can then change the ring, but the
+    * placeholders keep the scan correct. The ring_lock tells other
+    * threads that the ring contains placeholders.
     */
-    if (self->ring_lock)
+    PER_BEGIN_CRITICAL_SECTION(self);
+    if (!self->ring_lock)
     {
-        Py_INCREF(Py_None);
-        return Py_None;
-    }
-
-    self->ring_lock = 1;
-    if (scan_gc_items(self, target_size, target_size_bytes) < 0)
-    {
+        self->ring_lock = 1;
+        result = scan_gc_items(self, target_size, target_size_bytes);
         self->ring_lock = 0;
-        return NULL;
     }
-    self->ring_lock = 0;
+    PER_END_CRITICAL_SECTION();
 
+    if (result < 0)
+        return NULL;
     Py_INCREF(Py_None);
     return Py_None;
 }
@@ -300,17 +425,25 @@ static PyObject *
 cc_incrgc(ccobject *self, PyObject *args)
 {
     int obsolete_arg = -999;
-    int starting_size = self->non_ghost_count;
-    int target_size = self->cache_size;
-    Py_ssize_t target_size_bytes = self->cache_size_bytes;
+    int starting_size;
+    int target_size;
+    Py_ssize_t target_size_bytes;
+    int cache_drain_resistance;
 
-    if (self->cache_drain_resistance >= 1)
+    PER_BEGIN_CRITICAL_SECTION(self);
+    starting_size = self->non_ghost_count;
+    target_size = self->cache_size;
+    target_size_bytes = self->cache_size_bytes;
+    cache_drain_resistance = self->cache_drain_resistance;
+    PER_END_CRITICAL_SECTION();
+
+    if (cache_drain_resistance >= 1)
     {
         /* This cache will gradually drain down to a small size. Check
             a (small) number of objects proportional to the current size */
 
         int target_size_2 = (starting_size - 1
-                            - starting_size / self->cache_drain_resistance);
+                            - starting_size / cache_drain_resistance);
         if (target_size_2 < target_size)
             target_size = target_size_2;
     }
@@ -365,13 +498,12 @@ cc_minimize(ccobject *self, PyObject *args)
 static int
 _invalidate(ccobject *self, PyObject *key)
 {
-    PyObject *meth, *v;
+    PyObject *meth, *v, *r;
+    int result = 0;
 
+    PER_BEGIN_CRITICAL_SECTION(self);
     v = PyDict_GetItem(self->data, key);
-    if (v == NULL)
-        return 0;
-
-    if (Py_REFCNT(v) <= 1 && PyType_Check(v))
+    if (v != NULL && Py_REFCNT(v) <= 1 && PyType_Check(v))
     {
         /* This looks wrong, but it isn't. We use strong references to types
             because they don't have the ring members.
@@ -380,19 +512,45 @@ _invalidate(ccobject *self, PyObject *key)
             they are modified.  We can fix this by using wekrefs uniformly.
         */
         self->klass_count--;
-        return PyDict_DelItem(self->data, key);
+        result = PyDict_DelItem(self->data, key);
+        v = NULL;
     }
+#ifdef PER_FREE_THREADING
+    else if (v != NULL)
+    {
+        /* Keep the object alive while _p_invalidate() runs. */
+        if (IS_ENTRY(v))
+        {
+            v = ENTRY_OBJECT(v);
+            /* An object in deallocation needs no invalidation. */
+            if (!PyUnstable_TryIncRef(v))
+                v = NULL;
+        }
+        else
+            Py_INCREF(v);
+    }
+#endif
+    PER_END_CRITICAL_SECTION();
+
+    if (v == NULL)
+        return result;
 
     meth = PyObject_GetAttr(v, py__p_invalidate);
     if (meth == NULL)
-        return -1;
-
-    v = PyObject_CallObject(meth, NULL);
-    Py_DECREF(meth);
-    if (v == NULL)
-        return -1;
+        result = -1;
+    else
+    {
+        r = PyObject_CallObject(meth, NULL);
+        Py_DECREF(meth);
+        if (r == NULL)
+            result = -1;
+        else
+            Py_DECREF(r);
+    }
+#ifdef PER_FREE_THREADING
     Py_DECREF(v);
-    return 0;
+#endif
+    return result;
 }
 
 static PyObject *
@@ -451,22 +609,75 @@ cc_get(ccobject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "O|O:get", &key, &d))
         return NULL;
 
-    r = PyDict_GetItem(self->data, key);
+    PER_BEGIN_CRITICAL_SECTION(self);
+    r = cc_lookup_ref(self, key);
+    PER_END_CRITICAL_SECTION();
     if (!r)
     {
         if (d)
             r = d;
         else
             r = Py_None;
+        Py_INCREF(r);
     }
-    Py_INCREF(r);
     return r;
 }
 
 static PyObject *
 cc_items(ccobject *self)
 {
+#ifdef PER_FREE_THREADING
+    /* Return a list. A view of the dict would show the entries, and
+       another thread could change the dict while the caller iterates. */
+    PyObject *l, *k, *v, *item;
+    Py_ssize_t p = 0;
+    int error = 0;
+
+    l = PyList_New(0);
+    if (l == NULL)
+        return NULL;
+
+    PER_BEGIN_CRITICAL_SECTION(self);
+    while (PyDict_Next(self->data, &p, &k, &v))
+    {
+        if (IS_ENTRY(v))
+        {
+            v = ENTRY_OBJECT(v);
+            /* Skip an object in deallocation. */
+            if (!PyUnstable_TryIncRef(v))
+                continue;
+        }
+        else
+            Py_INCREF(v);
+        /* The item takes the new reference to v. A Py_DECREF() here
+           could free an object and change the dict. */
+        item = PyTuple_New(2);
+        if (item == NULL)
+        {
+            Py_DECREF(v);
+            error = 1;
+            break;
+        }
+        Py_INCREF(k);
+        PyTuple_SET_ITEM(item, 0, k);
+        PyTuple_SET_ITEM(item, 1, v);
+        if (PyList_Append(l, item) < 0)
+            error = 1;
+        Py_DECREF(item);
+        if (error)
+            break;
+    }
+    PER_END_CRITICAL_SECTION();
+
+    if (error)
+    {
+        Py_DECREF(l);
+        return NULL;
+    }
+    return l;
+#else
     return PyObject_CallMethod(self->data, "items", "");
+#endif
 }
 
 static PyObject *
@@ -474,11 +685,13 @@ cc_klass_items(ccobject *self)
 {
     PyObject *l,*k,*v;
     Py_ssize_t p = 0;
+    int error = 0;
 
     l = PyList_New(0);
     if (l == NULL)
         return NULL;
 
+    PER_BEGIN_CRITICAL_SECTION(self);
     while (PyDict_Next(self->data, &p, &k, &v))
     {
         if(PyType_Check(v))
@@ -486,19 +699,25 @@ cc_klass_items(ccobject *self)
             v = Py_BuildValue("OO", k, v);
             if (v == NULL)
             {
-                Py_DECREF(l);
-                return NULL;
+                error = 1;
+                break;
             }
             if (PyList_Append(l, v) < 0)
             {
                 Py_DECREF(v);
-                Py_DECREF(l);
-                return NULL;
+                error = 1;
+                break;
             }
             Py_DECREF(v);
         }
     }
+    PER_END_CRITICAL_SECTION();
 
+    if (error)
+    {
+        Py_DECREF(l);
+        return NULL;
+    }
     return l;
 }
 
@@ -507,13 +726,20 @@ cc_debug_info(ccobject *self)
 {
     PyObject *l,*k,*v;
     Py_ssize_t p = 0;
+    int error = 0;
 
     l = PyList_New(0);
     if (l == NULL)
         return NULL;
 
+    PER_BEGIN_CRITICAL_SECTION(self);
     while (PyDict_Next(self->data, &p, &k, &v))
     {
+#ifdef PER_FREE_THREADING
+        /* The values below keep no reference to the object. */
+        if (IS_ENTRY(v))
+            v = ENTRY_OBJECT(v);
+#endif
         if (Py_REFCNT(v) <= 0)
             v = Py_BuildValue("On", k, Py_REFCNT(v));
 
@@ -526,18 +752,20 @@ cc_debug_info(ccobject *self)
         else
             v = Py_BuildValue("Ons", k, Py_REFCNT(v), Py_TYPE(v)->tp_name);
 
-        if (v == NULL)
-            goto err;
-
-        if (PyList_Append(l, v) < 0)
-            goto err;
+        if (v == NULL || PyList_Append(l, v) < 0)
+        {
+            error = 1;
+            break;
+        }
     }
+    PER_END_CRITICAL_SECTION();
 
+    if (error)
+    {
+        Py_DECREF(l);
+        return NULL;
+    }
     return l;
-
-err:
-    Py_DECREF(l);
-    return NULL;
 }
 
 static PyObject *
@@ -545,7 +773,13 @@ cc_lru_items(ccobject *self)
 {
     PyObject *l;
     CPersistentRing *here;
+    int error = 0;
 
+    l = PyList_New(0);
+    if (l == NULL)
+        return NULL;
+
+    PER_BEGIN_CRITICAL_SECTION(self);
     if (self->ring_lock)
     {
         /* When the ring lock is held, we have no way of know which
@@ -553,43 +787,85 @@ cc_lru_items(ccobject *self)
             placeholders. */
         PyErr_SetString(PyExc_ValueError,
                         ".lru_items() is unavailable during garbage collection");
-        return NULL;
+        error = 1;
     }
-
-    l = PyList_New(0);
-    if (l == NULL)
-        return NULL;
-
-    here = self->ring_home.r_next;
-    while (here != &self->ring_home)
+    else
     {
-        PyObject *v;
-        cPersistentObject *object = OBJECT_FROM_RING(self, here);
+        here = self->ring_home.r_next;
+        while (here != &self->ring_home)
+        {
+            PyObject *v;
+            cPersistentObject *object = OBJECT_FROM_RING(self, here);
 
-        if (object == NULL)
-        {
-            Py_DECREF(l);
-            return NULL;
-        }
-        v = Py_BuildValue("OO", object->oid, object);
-        if (v == NULL)
-        {
-            Py_DECREF(l);
-            return NULL;
-        }
-        if (PyList_Append(l, v) < 0)
-        {
+            if (object == NULL)
+            {
+                error = 1;
+                break;
+            }
+            v = Py_BuildValue("OO", object->oid, object);
+            if (v == NULL)
+            {
+                error = 1;
+                break;
+            }
+            if (PyList_Append(l, v) < 0)
+            {
+                Py_DECREF(v);
+                error = 1;
+                break;
+            }
             Py_DECREF(v);
-            Py_DECREF(l);
-            return NULL;
+            here = here->r_next;
         }
-        Py_DECREF(v);
-        here = here->r_next;
     }
+    PER_END_CRITICAL_SECTION();
 
+    if (error)
+    {
+        Py_DECREF(l);
+        return NULL;
+    }
     return l;
 }
 
+#ifdef PER_FREE_THREADING
+static void
+cc_oid_unreferenced(ccobject *self, PyObject *oid)
+{
+    /* This is called by the persistent object deallocation function
+        when the reference count on a persistent object reaches
+        zero. The caller holds the critical section of the cache. Remove
+        the entry of the object. The dict does not change the reference
+        count of the object. The caller releases the reference of the
+        object to the cache.
+    */
+    PyObject *v;
+
+    /* If the cache has been cleared by GC, data will be NULL. */
+    if (!self->data)
+        return;
+
+    v = PyDict_GetItem(self->data, oid);
+    if (v == NULL || !IS_ENTRY(v))
+        return;
+
+    if (PyUnstable_TryIncRef(ENTRY_OBJECT(v)))
+    {
+        /* This entry is not for the dying object. A lookup found the
+           dying object absent, and a new object took the oid. Keep the
+           entry. */
+        Py_DECREF(ENTRY_OBJECT(v));
+        return;
+    }
+
+    if (PyDict_DelItem(self->data, oid) < 0)
+    {
+        /* Write an unraisable error, like an exception from __del__. */
+        PyErr_WriteUnraisable(oid);
+        PyErr_Clear();
+    }
+}
+#else
 static void
 cc_oid_unreferenced(ccobject *self, PyObject *oid)
 {
@@ -611,9 +887,9 @@ cc_oid_unreferenced(ccobject *self, PyObject *oid)
     dead_pers_obj = (cPersistentObject*)PyDict_GetItem(self->data, oid);
     assert(dead_pers_obj);
 
-    /* In the free-threaded build, Per_dealloc temporarily sets refcount
-       to 2 before calling us, to prevent PyDict_GetItem's internal
-       INCREF/DECREF from triggering recursive deallocation.
+    /* In the free-threaded build of Python 3.13, Per_dealloc temporarily
+       sets refcount to 2 before calling us, to prevent PyDict_GetItem's
+       internal INCREF/DECREF from triggering recursive deallocation.
        In the standard (GIL) build, refcount is 0 at this point. */
 #ifdef Py_GIL_DISABLED
     assert(Py_REFCNT(dead_pers_obj) == 2);
@@ -657,7 +933,8 @@ cc_oid_unreferenced(ccobject *self, PyObject *oid)
     dead_pers_obj->cache = NULL;
 
     /* After 2 INCREFs and 1 DECREF (from PyDict_DelItem), the refcount
-       is base + 1 (1 in standard build, 3 in free-threaded build). */
+       is base + 1 (1 in standard build, 3 in free-threaded build of
+       Python 3.13). */
 #ifdef Py_GIL_DISABLED
     assert(Py_REFCNT(dead_pers_obj) == 3);
 #else
@@ -669,6 +946,7 @@ cc_oid_unreferenced(ccobject *self, PyObject *oid)
         will all be invoked recursively.
     */
 }
+#endif
 
 static PyObject *
 cc_ringlen(ccobject *self)
@@ -676,9 +954,11 @@ cc_ringlen(ccobject *self)
     CPersistentRing *here;
     int c = 0;
 
+    PER_BEGIN_CRITICAL_SECTION(self);
     for (here = self->ring_home.r_next; here != &self->ring_home;
         here = here->r_next)
         c++;
+    PER_END_CRITICAL_SECTION();
     return INT_FROM_LONG(c);
 }
 
@@ -691,8 +971,9 @@ cc_update_object_size_estimation(ccobject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "OI:updateObjectSizeEstimation",
                             &oid, &new_size))
         return NULL;
+    PER_BEGIN_CRITICAL_SECTION(self);
     /* Note: reference borrowed */
-    v = (cPersistentObject *)PyDict_GetItem(self->data, oid);
+    v = (cPersistentObject *)cc_lookup(self, oid);
     if (v)
     {
         /* we know this object -- update our "total_size_estimation"
@@ -710,13 +991,14 @@ cc_update_object_size_estimation(ccobject *self, PyObject *args)
             /* v->estimated_size = new_size; */
         }
     }
+    PER_END_CRITICAL_SECTION();
     Py_RETURN_NONE;
 }
 
 static PyObject*
 cc_new_ghost(ccobject *self, PyObject *args)
 {
-    PyObject *tmp, *key, *v;
+    PyObject *tmp, *key, *v, *result = NULL;
 
     if (!PyArg_ParseTuple(args, "OO:new_ghost", &key, &v))
         return NULL;
@@ -764,22 +1046,24 @@ cc_new_ghost(ccobject *self, PyObject *args)
         return NULL;
     }
 
-    tmp = PyDict_GetItem(self->data, key);
+    PER_BEGIN_CRITICAL_SECTION(self);
+    tmp = cc_lookup_ref(self, key);
     if (tmp)
     {
         PyErr_SetString(PyExc_ValueError,
                         "The given oid is already in the cache");
-        return NULL;
+        goto done;
     }
 
     if (PyType_Check(v))
     {
+        /* These calls can run Python code. */
         if (PyObject_SetAttr(v, py__p_jar, self->jar) < 0)
-            return NULL;
+            goto done;
         if (PyObject_SetAttr(v, py__p_oid, key) < 0)
-            return NULL;
+            goto done;
         if (PyDict_SetItem(self->data, key, v) < 0)
-            return NULL;
+            goto done;
         PyObject_GC_UnTrack((void *)self->data);
         self->klass_count++;
     }
@@ -790,14 +1074,11 @@ cc_new_ghost(ccobject *self, PyObject *args)
         if(p->cache != NULL)
         {
             PyErr_SetString(PyExc_AssertionError, "Already in a cache");
-            return NULL;
+            goto done;
         }
 
-        if (PyDict_SetItem(self->data, key, v) < 0)
-            return NULL;
-        /* the dict should have a borrowed reference */
-        PyObject_GC_UnTrack((void *)self->data);
-        Py_DECREF(v);
+        if (cc_store(self, key, v) < 0)
+            goto done;
 
         Py_INCREF(self);
         p->cache = (PerCache *)self;
@@ -808,7 +1089,12 @@ cc_new_ghost(ccobject *self, PyObject *args)
         p->state = cPersistent_GHOST_STATE;
     }
 
-    Py_RETURN_NONE;
+    Py_INCREF(Py_None);
+    result = Py_None;
+done:
+    PER_END_CRITICAL_SECTION();
+    Py_XDECREF(tmp);
+    return result;
 }
 
 static struct PyMethodDef cc_methods[] = {
@@ -911,10 +1197,12 @@ cc_dealloc(ccobject *self)
 }
 
 static int
-cc_clear(ccobject *self)
+cc_clear_lock_held(ccobject *self)
 {
+#ifndef PER_FREE_THREADING
     Py_ssize_t pos = 0;
     PyObject *k, *v;
+#endif
     /* Clearing the cache is delicate.
 
         A non-ghost object will show up in the ring and in the dict.  If
@@ -941,7 +1229,9 @@ cc_clear(ccobject *self)
 
         if (o->cache)
         {
+#ifndef PER_FREE_THREADING
             Py_INCREF(o); /* account for uncounted reference */
+#endif
             if (PyDict_DelItem(self->data, o->oid) < 0)
                 return -1;
         }
@@ -956,16 +1246,31 @@ cc_clear(ccobject *self)
 
     Py_XDECREF(self->jar);
 
+#ifndef PER_FREE_THREADING
     while (PyDict_Next(self->data, &pos, &k, &v))
     {
         Py_INCREF(v);
         if (PyDict_SetItem(self->data, k, Py_None) < 0)
             return -1;
     }
+#endif
+    /* On the free-threaded build, the entries hold the uncounted
+       references, and the dict can release them. */
     Py_XDECREF(self->data);
     self->data = NULL;
     self->jar = NULL;
     return 0;
+}
+
+static int
+cc_clear(ccobject *self)
+{
+    int result;
+
+    PER_BEGIN_CRITICAL_SECTION(self);
+    result = cc_clear_lock_held(self);
+    PER_END_CRITICAL_SECTION();
+    return result;
 }
 
 static int
@@ -1016,7 +1321,12 @@ cc_traverse(ccobject *self, visitproc visit, void *arg)
 static Py_ssize_t
 cc_length(ccobject *self)
 {
-    return PyObject_Length(self->data);
+    Py_ssize_t result;
+
+    PER_BEGIN_CRITICAL_SECTION(self);
+    result = PyObject_Length(self->data);
+    PER_END_CRITICAL_SECTION();
+    return result;
 }
 
 static PyObject *
@@ -1024,13 +1334,14 @@ cc_subscript(ccobject *self, PyObject *key)
 {
     PyObject *r;
 
-    r = PyDict_GetItem(self->data, key);
+    PER_BEGIN_CRITICAL_SECTION(self);
+    r = cc_lookup_ref(self, key);
+    PER_END_CRITICAL_SECTION();
     if (r == NULL)
     {
         PyErr_SetObject(PyExc_KeyError, key);
         return NULL;
     }
-    Py_INCREF(r);
 
     return r;
 }
@@ -1102,29 +1413,32 @@ cc_add_item(ccobject *self, PyObject *key, PyObject *v)
     }
     Py_DECREF(jar);
 
-    object_again = PyDict_GetItem(self->data, key);
+    PER_BEGIN_CRITICAL_SECTION(self);
+    result = -1;
+    object_again = cc_lookup_ref(self, key);
     if (object_again)
     {
         if (object_again != v)
         {
             PyErr_SetString(PyExc_ValueError,
                             "A different object already has the same oid");
-            return -1;
         }
         else
         {
             /* re-register under the same oid - no work needed */
-            return 0;
+            result = 0;
         }
+        goto done;
     }
 
     if (PyType_Check(v))
     {
         if (PyDict_SetItem(self->data, key, v) < 0)
-            return -1;
+            goto done;
         PyObject_GC_UnTrack((void *)self->data);
         self->klass_count++;
-        return 0;
+        result = 0;
+        goto done;
     }
     else
     {
@@ -1135,7 +1449,7 @@ cc_add_item(ccobject *self, PyObject *key, PyObject *v)
                 /* This object is already in a different cache. */
                 PyErr_SetString(PyExc_ValueError,
                                 "Cache values may only be in one cache.");
-            return -1;
+            goto done;
         }
         /* else:
 
@@ -1145,11 +1459,8 @@ cc_add_item(ccobject *self, PyObject *key, PyObject *v)
         */
     }
 
-    if (PyDict_SetItem(self->data, key, v) < 0)
-        return -1;
-    /* the dict should have a borrowed reference */
-    PyObject_GC_UnTrack((void *)self->data);
-    Py_DECREF(v);
+    if (cc_store(self, key, v) < 0)
+        goto done;
 
     p = (cPersistentObject *)v;
     Py_INCREF(self);
@@ -1163,9 +1474,68 @@ cc_add_item(ccobject *self, PyObject *key, PyObject *v)
         /* this list should have a new reference to the object */
         Py_INCREF(v);
     }
-    return 0;
+    result = 0;
+done:
+    PER_END_CRITICAL_SECTION();
+    Py_XDECREF(object_again);
+    return result;
 }
 
+#ifdef PER_FREE_THREADING
+static int
+cc_del_item(ccobject *self, PyObject *key)
+{
+    PyObject *v, *cache = NULL;
+    cPersistentObject *p;
+    int in_ring = 0;
+    int result = -1;
+
+    PER_BEGIN_CRITICAL_SECTION(self);
+    /* An object in deallocation is absent. Its deallocation removes
+       the entry. */
+    v = cc_lookup_ref(self, key);
+    if (v == NULL)
+    {
+        PyErr_SetObject(PyExc_KeyError, key);
+        goto done;
+    }
+
+    if (PyType_Check(v))
+    {
+        self->klass_count--;
+    }
+    else
+    {
+        /* unlink this item from the ring */
+        p = (cPersistentObject *)v;
+        in_ring = p->ring.r_next != NULL;
+        if (in_ring)
+        {
+            self->non_ghost_count--;
+            ring_del(&p->ring);
+        }
+        cache = (PyObject *)p->cache;
+        p->cache = NULL;
+    }
+
+    if (PyDict_DelItem(self->data, key) < 0)
+    {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "unexpectedly couldn't remove key in cc_ass_sub");
+        goto done;
+    }
+    result = 0;
+done:
+    PER_END_CRITICAL_SECTION();
+    /* These calls can free objects. Make them after the critical
+       section. */
+    Py_XDECREF(cache);
+    if (in_ring)
+        Py_DECREF(v); /* the reference of the ring */
+    Py_XDECREF(v);
+    return result;
+}
+#else
 static int
 cc_del_item(ccobject *self, PyObject *key)
 {
@@ -1217,6 +1587,7 @@ cc_del_item(ccobject *self, PyObject *key)
 
     return 0;
 }
+#endif
 
 static int
 cc_ass_sub(ccobject *self, PyObject *key, PyObject *v)
@@ -1244,7 +1615,46 @@ static PyMappingMethods cc_as_mapping =
 static PyObject *
 cc_cache_data(ccobject *self, void *context)
 {
+#ifdef PER_FREE_THREADING
+    PyObject *copy, *k, *v, *failed = NULL;
+    Py_ssize_t p = 0;
+
+    copy = PyDict_New();
+    if (copy == NULL)
+        return NULL;
+
+    PER_BEGIN_CRITICAL_SECTION(self);
+    while (PyDict_Next(self->data, &p, &k, &v))
+    {
+        if (IS_ENTRY(v))
+        {
+            v = ENTRY_OBJECT(v);
+            /* Skip an object in deallocation. */
+            if (!PyUnstable_TryIncRef(v))
+                continue;
+        }
+        else
+            Py_INCREF(v);
+        if (PyDict_SetItem(copy, k, v) < 0)
+        {
+            failed = v;
+            break;
+        }
+        /* The copy holds a reference. This does not free v. */
+        Py_DECREF(v);
+    }
+    PER_END_CRITICAL_SECTION();
+
+    if (failed)
+    {
+        Py_DECREF(failed);
+        Py_DECREF(copy);
+        return NULL;
+    }
+    return copy;
+#else
     return PyDict_Copy(self->data);
+#endif
 }
 
 static PyGetSetDef cc_getsets[] =
@@ -1343,6 +1753,11 @@ module_init(void)
     {
         return NULL;
     }
+
+#ifdef PER_FREE_THREADING
+    if (PyType_Ready(&CcentryType) < 0)
+        return NULL;
+#endif
 
     module = PyModule_Create(&moduledef);
     if (module == NULL)

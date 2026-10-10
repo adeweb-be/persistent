@@ -155,48 +155,87 @@ accessed(cPersistentObject *self)
         ring_move_to_head(&self->cache->ring_home, &self->ring);
 }
 
+#ifdef PER_FREE_THREADING
+/* Detach the instance dict of self and return it, or return NULL.
+   Two threads can deactivate the same object. Only one of them gets
+   the dict. */
+static PyObject *
+detach_dict(cPersistentObject *self)
+{
+    PyObject **dictptr, *dict = NULL;
+
+    dictptr = _PyObject_GetDictPtr((PyObject *)self);
+    if (dictptr)
+    {
+        Py_BEGIN_CRITICAL_SECTION(self);
+        dict = *dictptr;
+        *dictptr = NULL;
+        Py_END_CRITICAL_SECTION();
+    }
+    return dict;
+}
+#endif
+
 static void
 ghostify(cPersistentObject *self)
 {
-    PyObject **dictptr, *slotnames;
+#ifndef PER_FREE_THREADING
+    PyObject **dictptr;
+#endif
+    PyObject *slotnames;
     PyObject *errtype, *errvalue, *errtb;
+    PerCache *cache;
+    int in_ring;
 
     /* are we already a ghost? */
     if (self->state == cPersistent_GHOST_STATE)
         return;
 
     /* Is it ever possible to not have a cache? */
-    if (self->cache == NULL)
+    cache = self->cache;
+    if (cache == NULL)
     {
         self->state = cPersistent_GHOST_STATE;
         return;
     }
 
-    if (self->ring.r_next == NULL)
+    /* Another thread can ghostify the same object. Only the thread that
+       removes the object from the ring continues. */
+    PER_BEGIN_CRITICAL_SECTION(cache);
+    in_ring = self->cache == cache && self->ring.r_next != NULL;
+    if (in_ring)
+    {
+        /* If we're ghostifying an object, we better have some non-ghosts. */
+        assert(cache->non_ghost_count > 0);
+        cache->non_ghost_count--;
+        cache->total_estimated_size -=
+            _estimated_size_in_bytes(self->estimated_size);
+        ring_del(&self->ring);
+        self->state = cPersistent_GHOST_STATE;
+    }
+    PER_END_CRITICAL_SECTION();
+
+    if (!in_ring)
     {
         /* There's no way to raise an error in this routine. */
-#ifdef Py_DEBUG
+#if defined(Py_DEBUG) && !defined(PER_FREE_THREADING)
         fatal_1350(self, "ghostify", "claims to be in a cache but isn't");
 #else
         return;
 #endif
     }
 
-    /* If we're ghostifying an object, we better have some non-ghosts. */
-    assert(self->cache->non_ghost_count > 0);
-    self->cache->non_ghost_count--;
-    self->cache->total_estimated_size -=
-        _estimated_size_in_bytes(self->estimated_size);
-    ring_del(&self->ring);
-    self->state = cPersistent_GHOST_STATE;
-
     /* clear __dict__ */
+#ifdef PER_FREE_THREADING
+    Py_XDECREF(detach_dict(self));
+#else
     dictptr = _PyObject_GetDictPtr((PyObject *)self);
     if (dictptr && *dictptr)
     {
         Py_DECREF(*dictptr);
         *dictptr = NULL;
     }
+#endif
 
     /* clear all slots besides _p_*
      * ( for backward-compatibility reason we do this only if class does not
@@ -310,6 +349,14 @@ Per__p_deactivate(cPersistentObject *self)
 {
     if (self->state == cPersistent_UPTODATE_STATE && self->jar)
     {
+#ifdef PER_FREE_THREADING
+        PyObject *dict = detach_dict(self);
+        if (dict)
+        {
+            PyDict_Clear(dict);
+            Py_DECREF(dict);
+        }
+#else
         PyObject **dictptr = _PyObject_GetDictPtr((PyObject *)self);
         if (dictptr && *dictptr)
         {
@@ -317,6 +364,7 @@ Per__p_deactivate(cPersistentObject *self)
             Py_DECREF(*dictptr);
             *dictptr = NULL;
         }
+#endif
         /* Note that we need to set to ghost state unless we are
             called directly. Methods that override this need to
             do the same! */
@@ -772,40 +820,52 @@ Per__getstate__(cPersistentObject *self)
 static void
 Per_dealloc(cPersistentObject *self)
 {
+    PerCache *cache;
+
     PyObject_GC_UnTrack((PyObject *)self);
     Py_TRASHCAN_BEGIN(self, Per_dealloc)
-    if (self->state >= 0)
+    cache = self->cache;
+    if (cache)
     {
+        /* The last reference can go away in any thread. Other threads
+           can use the cache at the same time. */
+        PER_BEGIN_CRITICAL_SECTION(cache);
         /* If the cache has been cleared, then a non-ghost object
             isn't in the ring any longer.
         */
-        if (self->ring.r_next != NULL)
+        if (self->state >= 0 && self->ring.r_next != NULL)
         {
             /* if we're ghostifying an object, we better have some non-ghosts */
-            assert(self->cache->non_ghost_count > 0);
-            self->cache->non_ghost_count--;
-            self->cache->total_estimated_size -=
+            assert(cache->non_ghost_count > 0);
+            cache->non_ghost_count--;
+            cache->total_estimated_size -=
                 _estimated_size_in_bytes(self->estimated_size);
             ring_del(&self->ring);
         }
-    }
 
-#ifdef Py_GIL_DISABLED
-    /* In the free-threaded build, dict operations (PyDict_GetItem,
-       PyDict_DelItem) internally INCREF/DECREF values for thread safety.
-       The cache dict holds "stolen" (uncounted) references to persistent
-       objects, so their refcount is 0 while in the dict. When
-       percachedel calls PyDict_GetItem, the internal DECREF triggers
-       Per_dealloc recursively on the same object — infinite recursion.
+#if defined(Py_GIL_DISABLED) && !defined(PER_FREE_THREADING)
+        /* In the free-threaded build of Python 3.13, dict operations
+           (PyDict_GetItem, PyDict_DelItem) internally INCREF/DECREF values
+           for thread safety. The cache dict holds "stolen" (uncounted)
+           references to persistent objects, so their refcount is 0 while
+           in the dict. When percachedel calls PyDict_GetItem, the internal
+           DECREF triggers Per_dealloc recursively on the same object —
+           infinite recursion.
 
-       Temporarily set the refcount to a positive value so the dict
-       operations' INCREF/DECREF cycle does not trigger deallocation. */
-    if (self->cache)
+           Temporarily set the refcount to a positive value so the dict
+           operations' INCREF/DECREF cycle does not trigger deallocation.
+           On Python 3.14 and later, the dict holds entry objects, and the
+           dict operations do not change the refcount of self. */
         Py_SET_REFCNT((PyObject *)self, 2);
 #endif
 
-    if (self->cache)
-        cPersistenceCAPI->percachedel(self->cache, self->oid);
+        /* Remove the uncounted reference of the cache. Without
+           PER_FREE_THREADING, this also releases self->cache. */
+        cPersistenceCAPI->percachedel(cache, self->oid);
+        PER_END_CRITICAL_SECTION();
+    }
+    /* The cache can go away here. Release it after the critical
+       section. */
     Py_XDECREF(self->cache);
     Py_XDECREF(self->jar);
     Py_XDECREF(self->oid);
