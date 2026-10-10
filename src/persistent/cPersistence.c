@@ -70,7 +70,7 @@ init_strings(void)
   return 0;
 }
 
-#ifdef Py_DEBUG
+#if defined(Py_DEBUG) && !defined(PER_FREE_THREADING)
 static void
 fatal_1350(cPersistentObject *self, const char *caller, const char *detail)
 {
@@ -136,7 +136,10 @@ unghostify(cPersistentObject *self)
         Py_DECREF(r);
         if (self->cache && self->ring.r_next == NULL)
         {
-#ifdef Py_DEBUG
+            /* Without the GIL, another thread can deactivate the object
+               after setstate() returns. Then raise an error, also on a
+               debug build. */
+#if defined(Py_DEBUG) && !defined(PER_FREE_THREADING)
             fatal_1350(self, "unghostify",
                      "is not in the cache despite that we just "
                      "unghostified it");
