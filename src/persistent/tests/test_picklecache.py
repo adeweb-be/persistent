@@ -1313,6 +1313,46 @@ class CPickleCacheTests(PickleCacheTestMixin, unittest.TestCase):
         self.assertEqual(len(cache), 2)
         del keep
 
+    def _check_free_object_with_finalizer(self, ghost):
+        # The class of the object defines __del__. Freeing the object
+        # removes its entry from the cache.
+        KEY = b'123'
+        finalized = []
+
+        class Jar:
+            def setstate(self, obj):
+                """Does nothing."""
+
+            def register(self, obj):
+                """Does nothing."""
+
+        class Finalized(self._getRealPersistentClass()):
+            def __del__(self):
+                finalized.append(self._p_oid)
+
+        jar = Jar()
+        cache = self._getTargetClass()(jar)
+        obj = Finalized()
+        obj._p_oid = KEY
+        obj._p_jar = jar
+        cache[KEY] = obj
+        if ghost:
+            obj._p_deactivate()
+            del obj
+        else:
+            # Only the ring of the cache keeps the object.
+            del obj
+            cache.minimize()
+        self.assertEqual(finalized, [KEY])
+        self.assertEqual(len(cache), 0)
+        self.assertIsNone(cache.get(KEY))
+
+    def test_free_ghost_with_finalizer(self):
+        self._check_free_object_with_finalizer(ghost=True)
+
+    def test_free_object_with_finalizer_after_sweep(self):
+        self._check_free_object_with_finalizer(ghost=False)
+
     def test_cache_garbage_collection_bytes_with_cache_size_0(self):
 
         class DummyConnection:

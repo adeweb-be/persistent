@@ -104,6 +104,15 @@
   PyUnstable_TryIncRef(). If this fails, the object is being freed, and
   the cache treats it as absent. Another object can then take the oid.
 
+  A __del__ method changes this protocol. CPython gives the object a
+  temporary reference while __del__ runs, and this clears the flag that
+  PyUnstable_EnableTryIncRef() set. While __del__ runs, lookups in other
+  threads miss the object. If __del__ keeps the object alive, another
+  object may have taken its oid meanwhile. After __del__ returns, and
+  until the deallocation removes the entry, a lookup in the same thread
+  can get the object that is being freed. The GIL build has the same
+  problem.
+
 */
 
 static char cPickleCache_doc_string[] =
@@ -830,33 +839,32 @@ cc_lru_items(ccobject *self)
 
 #ifdef PER_FREE_THREADING
 static void
-cc_oid_unreferenced(ccobject *self, PyObject *oid)
+cc_oid_unreferenced(ccobject *self, PyObject *dying)
 {
     /* This is called by the persistent object deallocation function
         when the reference count on a persistent object reaches
-        zero. The caller holds the critical section of the cache. Remove
-        the entry of the object. The dict does not change the reference
-        count of the object. The caller releases the reference of the
-        object to the cache.
+        zero. The argument is the object, not its oid. The caller holds
+        the critical section of the cache. Remove the entry of the
+        object. The dict does not change the reference count of the
+        object. The caller releases the reference of the object to the
+        cache.
+
+        Compare the pointers to find the entry of the object. Do not use
+        PyUnstable_TryIncRef() here: after a __del__ method, the thread
+        that frees the object owns it again, and the call succeeds.
     */
     PyObject *v;
+    PyObject *oid = ((cPersistentObject *)dying)->oid;
 
     /* If the cache has been cleared by GC, data will be NULL. */
     if (!self->data)
         return;
 
     v = PyDict_GetItem(self->data, oid);
-    if (v == NULL || !IS_ENTRY(v))
+    /* If the entry is for another object, a lookup found the dying
+       object absent, and a new object took the oid. Keep that entry. */
+    if (v == NULL || !IS_ENTRY(v) || ENTRY_OBJECT(v) != dying)
         return;
-
-    if (PyUnstable_TryIncRef(ENTRY_OBJECT(v)))
-    {
-        /* This entry is not for the dying object. A lookup found the
-           dying object absent, and a new object took the oid. Keep the
-           entry. */
-        Py_DECREF(ENTRY_OBJECT(v));
-        return;
-    }
 
     if (PyDict_DelItem(self->data, oid) < 0)
     {

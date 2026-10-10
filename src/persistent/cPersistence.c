@@ -875,9 +875,15 @@ Per_dealloc(cPersistentObject *self)
         Py_SET_REFCNT((PyObject *)self, 2);
 #endif
 
-        /* Remove the uncounted reference of the cache. Without
-           PER_FREE_THREADING, this also releases self->cache. */
+        /* Remove the uncounted reference of the cache. With
+           PER_FREE_THREADING, the argument is the object, so that the
+           cache can find its entry. Without PER_FREE_THREADING, the
+           argument is the oid, and this also releases self->cache. */
+#ifdef PER_FREE_THREADING
+        cPersistenceCAPI->percachedel(cache, (PyObject *)self);
+#else
         cPersistenceCAPI->percachedel(cache, self->oid);
+#endif
         PER_END_CRITICAL_SECTION();
     }
     /* The cache can go away here. Release it after the critical

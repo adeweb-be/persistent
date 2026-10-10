@@ -255,9 +255,20 @@ class ConcurrentCacheTests(TestCase):
         loads the same oids. A lookup must not return an object that is
         being freed. A new ghost can then take the oid.
         """
+        self._check_lookup_during_final_decref(self._makePersistentClass())
+
+    def test_lookup_during_final_decref_with_finalizer(self):
+        """The same race, with a class that defines __del__."""
+
+        class P(self._makePersistentClass()):
+            def __del__(self):
+                """Does nothing."""
+
+        self._check_lookup_during_final_decref(P)
+
+    def _check_lookup_during_final_decref(self, P):
         jar = self._makeJar()
         cache = jar._cache
-        P = self._makePersistentClass()
         n_oids = 100
         errors = []
         stop = threading.Event()

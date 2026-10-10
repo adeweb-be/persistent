@@ -92,6 +92,8 @@ typedef struct {
     cPersistent_HEAD
 } cPersistentObject;
 
+/* The deallocation of a persistent object calls percachedel(cache, oid).
+   With PER_FREE_THREADING, the second argument is the object itself. */
 typedef void (*percachedelfunc)(PerCache *, PyObject *);
 
 typedef struct {
