@@ -102,16 +102,24 @@ unghostify(cPersistentObject *self)
     if (self->state < 0 && self->jar)
     {
         PyObject *r;
+        PerCache *cache = self->cache;
 
         /* Is it ever possible to not have a cache? */
-        if (self->cache)
+        if (cache)
         {
-            /* Create a node in the ring for this unghostified object. */
-            self->cache->non_ghost_count++;
-            self->cache->total_estimated_size +=
-                _estimated_size_in_bytes(self->estimated_size);
-            ring_add(&self->cache->ring_home, &self->ring);
-            Py_INCREF(self);
+            /* Another thread can sweep the cache, or unghostify the same
+               object. */
+            PER_BEGIN_CRITICAL_SECTION(cache);
+            if (self->cache == cache && self->ring.r_next == NULL)
+            {
+                /* Create a node in the ring for this unghostified object. */
+                cache->non_ghost_count++;
+                cache->total_estimated_size +=
+                    _estimated_size_in_bytes(self->estimated_size);
+                ring_add(&cache->ring_home, &self->ring);
+                Py_INCREF(self);
+            }
+            PER_END_CRITICAL_SECTION();
         }
         /* set state to CHANGED while setstate() call is in progress
             to prevent a recursive call to _PyPersist_Load().

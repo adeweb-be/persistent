@@ -23,8 +23,9 @@ Change log
   references, and lookups take a reference with ``PyUnstable_TryIncRef()``,
   so that a lookup in one thread cannot return an object that another thread
   is freeing. On that build, ``PickleCache.items()`` returns a list.
-  Attribute access and the loading of ghosts change the ring without the
-  critical section: they rely on one thread at a time per connection.
+  The loading of ghosts takes the critical section too. Attribute access
+  changes the ring without the critical section: it relies on one thread at
+  a time per connection.
 
 
 6.8 (2026-08-20)
