@@ -24,8 +24,12 @@ Change log
   so that a lookup in one thread cannot return an object that another thread
   is freeing. On that build, ``PickleCache.items()`` returns a list.
   The loading of ghosts and attribute access take the critical section too,
-  so that the ring stays consistent when another thread sweeps the cache of
-  a connection in use, for example with ``DB.cacheMinimize()``.
+  so that the ring stays consistent when several threads use one cache.
+  This does not make it safe to deactivate objects that another thread
+  uses: a sweep of the cache of a connection in use, for example with
+  ``DB.cacheMinimize()`` from another thread, is still not supported. The
+  thread that uses the objects can then get ``AttributeError`` or
+  ``SystemError``, or read an instance dict that is being freed.
 
 
 6.8 (2026-08-20)

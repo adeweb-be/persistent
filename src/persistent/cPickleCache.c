@@ -91,6 +91,11 @@
   dict, the ring and the counters. The functions in cPersistence.c that
   change the ring or the counters take the same critical section.
 
+  This keeps the cache consistent. It does not make a persistent object
+  safe to use from two threads at once. If a thread deactivates an object
+  that another thread reads, for example in a sweep, the reader can see a
+  ghost, or read an instance dict that is being freed.
+
   The dict cannot hold the uncounted references directly. A dict lookup
   increments and decrements the reference count of the value. This can
   free an object that another thread released, or bring back an object

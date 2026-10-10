@@ -324,8 +324,9 @@ class ConcurrentCacheTests(TestCase):
         """Read attributes while another thread sweeps the cache.
 
         An attribute access moves the object in the ring of its cache.
-        DB.cacheMinimize() sweeps the caches of connections that other
-        threads use. The two threads use different objects of one cache.
+        The two threads use different objects of one cache, so this test
+        checks only the ring. Deactivating objects that another thread
+        reads is not supported.
         """
         jar = self._makeJar()
         cache = jar._cache
