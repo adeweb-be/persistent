@@ -424,6 +424,102 @@ class ConcurrentCacheTests(TestCase):
         self.assertEqual(errors, [], f"Errors in threads: {errors}")
 
 
+
+@skipIfNoCExtension
+class InstanceDictTests(TestCase):
+    """Test the instance dict of an object that is invalidated and loaded.
+
+    On Python 3.13 and later, the instance dict of an object can use the
+    inline values of the object. A dict that an invalidation removes must
+    not keep these values, because the next load puts the new state in
+    them.
+    """
+
+    def _makeObject(self):
+        from persistent import Persistent
+        from persistent.cPickleCache import PickleCache
+
+        class P(Persistent):
+            pass
+
+        jar = _StateJar()
+        jar._cache = PickleCache(jar, 100)
+        obj = P()
+        obj._p_oid = _make_oid(1)
+        obj._p_jar = jar
+        jar._cache[obj._p_oid] = obj
+        obj._p_invalidate()
+        return jar, obj
+
+    def _assertState(self, obj, value):
+        # Check the state first. A broken state can crash dir(), and
+        # thus the report of an AttributeError.
+        self.assertEqual(obj.__getstate__(), {'value': value})
+        self.assertEqual(getattr(obj, 'value', None), value)
+
+    def test_clear_removed_dict_after_load(self):
+        jar, obj = self._makeObject()
+        jar.value = 1
+        self._assertState(obj, 1)
+        removed = obj.__dict__
+        obj._p_invalidate()
+        jar.value = 2
+        self._assertState(obj, 2)
+        # The removed dict must not share values with the object.
+        removed.clear()
+        self._assertState(obj, 2)
+
+    def test_gc_after_invalidate_in_other_thread(self):
+        """Invalidate and load an object that another thread loaded.
+
+        On the free-threaded build, the thread that creates an object
+        owns its reference count. When another thread releases the last
+        reference, the object goes to the owner thread, and a garbage
+        collection can clear it before the owner thread frees it. The
+        cleared dict must not be the new state of the object.
+        """
+        jar, obj = self._makeObject()
+        jar.value = 1
+        loaded = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def owner():
+            try:
+                # The load in this thread creates the instance dict.
+                self.assertEqual(obj.value, 1)
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+            loaded.set()
+            release.wait(30)
+
+        thread = threading.Thread(target=owner)
+        thread.start()
+        try:
+            self.assertTrue(loaded.wait(30))
+            obj._p_invalidate()
+            jar.value = 2
+            self._assertState(obj, 2)
+            gc.collect()
+            self._assertState(obj, 2)
+        finally:
+            release.set()
+            thread.join(30)
+        self.assertEqual(errors, [])
+
+
+class _StateJar:
+    """Jar that loads the state {'value': value}."""
+
+    value = None
+
+    def register(self, obj):
+        pass
+
+    def setstate(self, obj):
+        obj.__setstate__({'value': self.value})
+
+
 class _DummyJar:
     """Minimal jar for threading tests.
 

@@ -31,6 +31,19 @@ Change log
   thread that uses the objects can then get ``AttributeError`` or
   ``SystemError``, or read an instance dict that is being freed.
 
+- Do not let a deactivated object share its inline values with its old
+  instance dict. On Python 3.13 and later, the instance dict of a
+  subclass of ``Persistent`` can use the inline values of the object.
+  ``_p_deactivate()`` and ``_p_invalidate()`` released that dict but left
+  the values in place, and the next load put the new state in them. If
+  the old dict was still alive, a change to it changed the state of the
+  object. On the free-threaded build, the garbage collector can clear
+  the old dict when a thread other than its owner releases it. The object
+  then lost its attributes: ``__getstate__()`` raised ``SystemError: null
+  argument to internal routine`` and ``dir()`` could crash. The C code
+  now moves the values into the old dict with
+  ``PyObject_ClearManagedDict()`` before it releases it.
+
 
 6.8 (2026-08-20)
 ----------------

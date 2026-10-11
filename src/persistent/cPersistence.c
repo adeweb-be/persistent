@@ -174,7 +174,6 @@ accessed(cPersistentObject *self)
     }
 }
 
-#ifdef PER_FREE_THREADING
 /* Detach the instance dict of self and return it, or return NULL.
    Two threads can deactivate the same object. Only one of them gets
    the dict. */
@@ -184,23 +183,31 @@ detach_dict(cPersistentObject *self)
     PyObject **dictptr, *dict = NULL;
 
     dictptr = _PyObject_GetDictPtr((PyObject *)self);
-    if (dictptr)
+    if (dictptr == NULL)
+        return NULL;
+
+    PER_BEGIN_CRITICAL_SECTION(self);
+    dict = *dictptr;
+#ifdef Py_TPFLAGS_INLINE_VALUES
+    if (dict && PyType_HasFeature(Py_TYPE(self), Py_TPFLAGS_INLINE_VALUES))
     {
-        Py_BEGIN_CRITICAL_SECTION(self);
-        dict = *dictptr;
-        *dictptr = NULL;
-        Py_END_CRITICAL_SECTION();
+        /* The dict can use the inline values of self. The next load puts
+           the new state in these values. Thus the dict must not keep
+           them: PyObject_ClearManagedDict() moves them into the dict,
+           and then releases the dict of self. */
+        Py_INCREF(dict);
+        PyObject_ClearManagedDict((PyObject *)self);
     }
+    else
+#endif
+        *dictptr = NULL;
+    PER_END_CRITICAL_SECTION();
     return dict;
 }
-#endif
 
 static void
 ghostify(cPersistentObject *self)
 {
-#ifndef PER_FREE_THREADING
-    PyObject **dictptr;
-#endif
     PyObject *slotnames;
     PyObject *errtype, *errvalue, *errtb;
     PerCache *cache;
@@ -245,16 +252,7 @@ ghostify(cPersistentObject *self)
     }
 
     /* clear __dict__ */
-#ifdef PER_FREE_THREADING
     Py_XDECREF(detach_dict(self));
-#else
-    dictptr = _PyObject_GetDictPtr((PyObject *)self);
-    if (dictptr && *dictptr)
-    {
-        Py_DECREF(*dictptr);
-        *dictptr = NULL;
-    }
-#endif
 
     /* clear all slots besides _p_*
      * ( for backward-compatibility reason we do this only if class does not
@@ -368,22 +366,12 @@ Per__p_deactivate(cPersistentObject *self)
 {
     if (self->state == cPersistent_UPTODATE_STATE && self->jar)
     {
-#ifdef PER_FREE_THREADING
         PyObject *dict = detach_dict(self);
         if (dict)
         {
             PyDict_Clear(dict);
             Py_DECREF(dict);
         }
-#else
-        PyObject **dictptr = _PyObject_GetDictPtr((PyObject *)self);
-        if (dictptr && *dictptr)
-        {
-            PyDict_Clear(*dictptr);
-            Py_DECREF(*dictptr);
-            *dictptr = NULL;
-        }
-#endif
         /* Note that we need to set to ghost state unless we are
             called directly. Methods that override this need to
             do the same! */
