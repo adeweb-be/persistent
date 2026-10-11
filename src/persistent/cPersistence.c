@@ -175,8 +175,13 @@ accessed(cPersistentObject *self)
 }
 
 /* Detach the instance dict of self and return it, or return NULL.
-   Two threads can deactivate the same object. Only one of them gets
-   the dict. */
+   The critical section on self serializes most calls from two threads
+   that deactivate the same object. It pauses when the dict lock in
+   PyObject_ClearManagedDict() blocks. Then both threads can get the
+   dict. Concurrent use of one object is not supported.
+   PyObject_ClearManagedDict() is documented only for tp_clear and
+   tp_dealloc. This use depends on the internals of CPython 3.13 and
+   3.14. Check it again on 3.15. */
 static PyObject *
 detach_dict(cPersistentObject *self)
 {

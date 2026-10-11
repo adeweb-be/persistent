@@ -424,7 +424,6 @@ class ConcurrentCacheTests(TestCase):
         self.assertEqual(errors, [], f"Errors in threads: {errors}")
 
 
-
 @skipIfNoCExtension
 class InstanceDictTests(TestCase):
     """Test the instance dict of an object that is invalidated and loaded.
