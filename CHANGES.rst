@@ -1,8 +1,8 @@
 Change log
 ==========
 
-6.9 (unreleased)
-----------------
+6.8+zoe.1 (unreleased)
+----------------------
 
 - Declare free-threading support in the C extensions, so that importing them
   on CPython 3.14t no longer enables the GIL. Module state that was
